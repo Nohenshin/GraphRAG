@@ -131,5 +131,8 @@ def get_process_config() -> Dict[str, Any]:
         "max_tokens_per_chunk": get_config("MAX_TOKENS_PER_CHUNK", 200),
         "top_k_retrieval": get_config("TOP_K_RETRIEVAL", 10),
         "with_context": get_config("WITH_CONTEXT", False),
-        "context_size": get_config("CONTEXT_SIZE", 2)
+        "context_size": get_config("CONTEXT_SIZE", 2),
+        "use_triplets": get_config("USE_TRIPLETS", True),
+        "use_multi_hop": get_config("USE_MULTI_HOP", False),
+        "hops": get_config("HOPS", 2)
     }

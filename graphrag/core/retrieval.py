@@ -126,6 +126,14 @@ class VectorRetriever(Retriever):
                 query_vector=query_embedding.tolist(),
                 limit=top_k
             )
+
+            for hit in search_results:
+                # hit.payload là dict, hit.id là UUID
+                chunk_id = hit.payload.get('original_id', hit.id)
+                chunk_text = hit.payload.get('text', self._fetch_chunk_text(chunk_id))
+                # Có thể hit.score hoặc hit.score?
+                score = getattr(hit, 'score', 0.0)
+                results.append((chunk_id, chunk_text, score))
             
             logger.info(f"Qdrant returned {len(search_results)} results")
             
@@ -713,6 +721,105 @@ def retrieve_with_context(query: str, top_k: int = 10, context_size: int = 2) ->
     """
     retriever = GraphRetriever()
     return retriever.retrieve_with_context(query, top_k, context_size)
+
+class MultiHopRetriever(Retriever):
+    """Multi-hop retrieval using graph traversal"""
+    
+    def __init__(self, neo4j_conn=None, qdrant_conn=None):
+        super().__init__(neo4j_conn, qdrant_conn)
+        self.graph_retriever = GraphRetriever(neo4j_conn)
+        # Entity extraction pattern (các cụm viết hoa)
+        self.entity_pattern = re.compile(r'[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*')
+        
+    def retrieve_chunks(self, query: str, top_k: int = 5, hops: int = 2) -> List[Tuple[str, str, float]]:
+        """
+        Multi-hop retrieval:
+        - Extract entities from query.
+        - For each entity, traverse RELATES_TO relationships up to `hops` depth.
+        - Collect chunks that mention any of the discovered entities.
+        - Score each chunk based on hop distance and entity relevance.
+        """
+        logger.info(f"Multi-hop retrieval for query: '{query}', hops={hops}, top_k={top_k}")
+        
+        # 1. Extract entities from query
+        entities = set(self.entity_pattern.findall(query))
+        if not entities:
+            logger.info("No entities found in query, falling back to graph retrieval")
+            return self.graph_retriever.retrieve_chunks(query, top_k)
+        
+        logger.info(f"Found entities: {entities}")
+        
+        # 2. Traverse graph to find related entities
+        related_entities = {}  # entity_name -> hop_distance
+        for entity in entities:
+            # Check if entity exists (case-insensitive)
+            exists = self.neo4j.run_query(
+                "MATCH (e:Entity) WHERE toLower(e.name) = toLower($name) RETURN e.name AS name LIMIT 1",
+                {"name": entity}
+            )
+            if exists:
+                entity = exists[0]["name"]  # use the actual name from graph
+            else:
+                logger.info(f"Entity '{entity}' not found in graph, skipping")
+                continue
+            
+            # Get related entities via RELATES_TO up to hops depth
+            # Sử dụng Cypher đơn giản (không cần APOC)
+            cypher = """
+            MATCH (start:Entity {name: $entity})-[r:RELATES_TO*1..$hops]->(related:Entity)
+            RETURN related.name AS name, length(r) AS distance
+            """
+            results = self.neo4j.run_query(cypher, {"entity": entity, "hops": hops})
+            
+            for row in results:
+                name = row["name"]
+                dist = row["distance"]
+                if name not in related_entities or related_entities[name] > dist:
+                    related_entities[name] = dist
+        
+        # Add original entities with distance 0
+        for ent in entities:
+            related_entities[ent] = 0
+        
+        logger.info(f"Found {len(related_entities)} entities within {hops} hops")
+        
+        # 3. For each entity, get chunks that mention it
+        chunk_scores = {}  # chunk_id -> (chunk_text, max_score)
+        for entity, dist in related_entities.items():
+            # Tìm chunk chứa entity (qua HAS_TERM hoặc MENTIONS_ENTITY)
+            cypher = """
+            MATCH (c:Chunk)-[:HAS_TERM]->(t:Term {text: $entity})
+            RETURN c.id AS id, c.text AS text, 1.0 AS score
+            UNION
+            MATCH (c:Chunk)-[:MENTIONS_ENTITY]->(e:Entity {name: $entity})
+            RETURN c.id AS id, c.text AS text, 0.9 AS score
+            """
+            results = self.neo4j.run_query(cypher, {"entity": entity})
+            
+            # weight: 1/(dist+1) càng xa thì trọng số càng thấp
+            weight = 1.0 / (dist + 1)
+            for row in results:
+                chunk_id = row["id"]
+                chunk_text = row["text"]
+                base_score = row["score"]
+                final_score = base_score * weight
+                
+                if chunk_id not in chunk_scores or chunk_scores[chunk_id][1] < final_score:
+                    chunk_scores[chunk_id] = (chunk_text, final_score)
+        
+        # 4. Convert to list and sort
+        results = [(cid, text, score) for cid, (text, score) in chunk_scores.items()]
+        results.sort(key=lambda x: x[2], reverse=True)
+        results = results[:top_k]
+        
+        logger.info(f"Multi-hop retrieved {len(results)} chunks")
+        return results
+
+# Standalone function for multi-hop
+def multi_hop_retrieve(query: str, top_k: int = 5, hops: int = 2) -> List[Tuple[str, str, float]]:
+    """Perform multi-hop retrieval"""
+    retriever = MultiHopRetriever()
+    return retriever.retrieve_chunks(query, top_k, hops)
 
 if __name__ == "__main__":
     # Demo with example query

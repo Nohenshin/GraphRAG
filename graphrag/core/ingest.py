@@ -23,33 +23,16 @@ class DocumentIngestor:
     """Handles document loading, processing, and storage in Neo4j and Qdrant"""
     
     def __init__(self, neo4j_conn=None, qdrant_conn=None, embedding_model=DEFAULT_EMBEDDING_MODEL):
-        """Initialize DocumentIngestor
-        
-        Args:
-            neo4j_conn: Neo4j connection instance
-            qdrant_conn: Qdrant connection instance
-            embedding_model: Name or path of the embedding model
-        """
         self.neo4j = neo4j_conn or get_neo4j_connection()
         self.qdrant = qdrant_conn or get_qdrant_connection()
         self.embedding_model = embedding_model
         logger.info(f"Using embedding model: {embedding_model}")
         
     def load_pdf(self, path: str) -> str:
-        """Load text from a PDF file
-        
-        Args:
-            path: Path to the PDF file
-            
-        Returns:
-            str: Extracted text from the PDF
-        """
         if fitz is None:
             raise ImportError("PyMuPDF (fitz) is required to load PDF files. Install with 'pip install pymupdf'")
-            
         if not os.path.exists(path):
             raise FileNotFoundError(f"PDF file not found: {path}")
-            
         logger.info(f"Loading PDF from {path}")
         text = ""
         try:
@@ -63,59 +46,33 @@ class DocumentIngestor:
             raise
             
     def chunk_text(self, text: str, max_tokens: int = 200) -> List[str]:
-        """Split text into chunks
-        
-        Args:
-            text: Input text
-            max_tokens: Maximum tokens per chunk
-            
-        Returns:
-            List[str]: List of text chunks
-        """
         if not text:
             logger.warning("Received empty text for chunking")
             return []
-            
         logger.info(f"Chunking text ({len(text)} chars) with max {max_tokens} tokens per chunk")
         sentences = nltk.sent_tokenize(text)
         chunks = []
         current_chunk = []
         current_length = 0
-        
         for sent in sentences:
             tokens = nltk.word_tokenize(sent)
             if current_length + len(tokens) > max_tokens and current_chunk:
-                # Start new chunk if current one would exceed max_tokens
                 chunks.append(" ".join(current_chunk))
                 current_chunk = []
                 current_length = 0
-                
             current_chunk.append(sent)
             current_length += len(tokens)
-            
-        # Add the final chunk if it's not empty
         if current_chunk:
             chunks.append(" ".join(current_chunk))
-            
         logger.info(f"Created {len(chunks)} chunks from input text")
         return chunks
         
     def embed_chunks(self, chunks: List[str]) -> np.ndarray:
-        """Generate embeddings for text chunks
-        
-        Args:
-            chunks: List of text chunks
-            
-        Returns:
-            np.ndarray: Matrix of embeddings (chunks × embedding_dim)
-        """
         if not chunks:
             logger.warning("No chunks provided for embedding")
             return np.array([])
-            
         logger.info(f"Generating embeddings for {len(chunks)} chunks")
         try:
-            # Use shared embedding utility with E5 passage prefix
             embeddings = embed_text(chunks, model_name=self.embedding_model, normalize=True)
             logger.info(f"Successfully generated embeddings of shape {embeddings.shape}")
             return embeddings
@@ -125,21 +82,11 @@ class DocumentIngestor:
             
     def store_chunks_in_neo4j(self, doc_id: str, chunks: List[str], 
                           embeddings: np.ndarray) -> None:
-        """Store document chunks and metadata in Neo4j
-        
-        Args:
-            doc_id: Document identifier
-            chunks: List of text chunks
-            embeddings: Chunk embeddings
-        """
-        # Create document node if it doesn't exist
         doc_query = """
         MERGE (d:Document {id: $doc_id})
         RETURN d
         """
         self.neo4j.run_query(doc_query, {"doc_id": doc_id})
-        
-        # Create chunk nodes and connect to document
         prev_chunk_id = None
         for i, (chunk_text, embedding) in enumerate(zip(chunks, embeddings)):
             chunk_id = f"{doc_id}_chunk{i}"
@@ -158,8 +105,6 @@ class DocumentIngestor:
                 "index": i
             }
             self.neo4j.run_query(chunk_query, params)
-            
-            # Create NEXT/PREV relationships between consecutive chunks
             if prev_chunk_id is not None:
                 relationship_query = """
                 MATCH (prev:Chunk {id: $prev_chunk_id})
@@ -173,41 +118,20 @@ class DocumentIngestor:
                     "curr_chunk_id": chunk_id
                 }
                 self.neo4j.run_query(relationship_query, relationship_params)
-                
             prev_chunk_id = chunk_id
-            
         logger.info(f"Stored {len(chunks)} chunks for document {doc_id} in Neo4j with NEXT/PREV relationships")
         
     def store_embeddings_in_qdrant(self, doc_id: str, chunks: List[str], 
                                 embeddings: np.ndarray) -> None:
-        """Store document chunk embeddings in Qdrant
-        
-        Args:
-            doc_id: Document identifier
-            chunks: List of text chunks
-            embeddings: Chunk embeddings
-        """
-        # Prepare IDs and metadata for Qdrant
-        ids = []
-        metadata = []
-        
-        for i, chunk_text in enumerate(chunks):
-            chunk_id = f"{doc_id}_chunk{i}"
-            ids.append(chunk_id)
-            metadata.append({
-                "doc_id": doc_id, 
-                "chunk_index": i,
-                "text": chunk_text[:1000]  # Store truncated text in metadata for quick access
-            })
-        
-        # Store in Qdrant
+        ids = [f"{doc_id}_chunk{i}" for i in range(len(chunks))]
+        metadata = [{"doc_id": doc_id, "chunk_index": i, "text": chunk[:1000]} for i, chunk in enumerate(chunks)]
         result = self.qdrant.upsert_vectors(
             collection_name="tokens", 
             vectors=embeddings.tolist(), 
             ids=ids, 
-            metadata=metadata
+            metadata=metadata,
+            timeout=120
         )
-        
         if result:
             logger.info(f"Stored {len(chunks)} embeddings for document {doc_id} in Qdrant")
         else:
@@ -215,81 +139,42 @@ class DocumentIngestor:
             
     def process_document(self, doc_id: str, text: str = None, pdf_path: str = None, 
                      max_tokens: int = 200) -> Tuple[List[str], np.ndarray]:
-        """Process a document: load, chunk, embed, and store
-        
-        Args:
-            doc_id: Document identifier
-            text: Document text (if provided directly)
-            pdf_path: Path to PDF file (if loading from PDF)
-            max_tokens: Maximum tokens per chunk
-            
-        Returns:
-            Tuple[List[str], np.ndarray]: Chunks and embeddings
-        """
-        # Load document
         if text is None and pdf_path is not None:
             text = self.load_pdf(pdf_path)
         elif text is None:
             raise ValueError("Either text or pdf_path must be provided")
-            
-        # Chunk text
         chunks = self.chunk_text(text, max_tokens)
         logger.info(f"Split document into {len(chunks)} chunks")
-        
-        # Generate embeddings
         embeddings = self.embed_chunks(chunks)
         logger.info(f"Generated embeddings of shape {embeddings.shape}")
-        
-        # Store in Neo4j
         self.store_chunks_in_neo4j(doc_id, chunks, embeddings)
-        
-        # Store in Qdrant
         self.store_embeddings_in_qdrant(doc_id, chunks, embeddings)
-        
         return chunks, embeddings
 
-# Convenience functions
+
+# ==================== CONVENIENCE FUNCTIONS ====================
+
+def process_document(doc_id: str, text: str = None, pdf_path: str = None, 
+                 max_tokens: int = 200) -> Tuple[List[str], np.ndarray]:
+    ingestor = DocumentIngestor()
+    return ingestor.process_document(doc_id, text, pdf_path, max_tokens)
 
 def load_pdf(path: str) -> str:
-    """Load text from a PDF file (standalone function)"""
     ingestor = DocumentIngestor()
     return ingestor.load_pdf(path)
 
 def chunk_text(text: str, max_tokens: int = 200) -> List[str]:
-    """Chunk text into segments (standalone function)"""
     ingestor = DocumentIngestor()
     return ingestor.chunk_text(text, max_tokens)
 
 def embed_chunks(chunks: List[str]) -> np.ndarray:
-    """Embed text chunks (standalone function)"""
     ingestor = DocumentIngestor()
     return ingestor.embed_chunks(chunks)
 
 def store_chunks_in_neo4j(doc_id: str, chunks: List[str], embeddings: np.ndarray) -> None:
-    """Store document chunks in Neo4j (standalone function)"""
     ingestor = DocumentIngestor()
     ingestor.store_chunks_in_neo4j(doc_id, chunks, embeddings)
 
 def store_embeddings_in_qdrant(doc_id: str, chunks: List[str], embeddings: np.ndarray) -> None:
-    """Store document chunk embeddings in Qdrant (standalone function)"""
     ingestor = DocumentIngestor()
     ingestor.store_embeddings_in_qdrant(doc_id, chunks, embeddings)
-
-def process_document(doc_id: str, text: str = None, pdf_path: str = None, 
-                 max_tokens: int = 200) -> Tuple[List[str], np.ndarray]:
-    """Process a document (standalone function)"""
-    ingestor = DocumentIngestor()
-    return ingestor.process_document(doc_id, text, pdf_path, max_tokens)
-    
-if __name__ == "__main__":
-    # Demo with example text
-    example_text = """
-    Hugging Face, Inc. is an American company that develops tools for building applications using machine learning.
-    It was founded in 2016 and its headquarters is in New York City. The company is known for its libraries in natural
-    language processing (NLP) and its platform that allows users to share machine learning models and datasets.
-    """
-    
-    print("Processing example document...")
-    chunks, embeddings = process_document("example_doc", text=example_text)
-    print(f"Created {len(chunks)} chunks with embeddings of shape {embeddings.shape}")
-    print("First chunk:", chunks[0]) 

@@ -106,7 +106,7 @@ class QdrantConnection:
         namespace = uuid.UUID('bf8def8c-49bf-4e0d-93d5-1c1d1c6b6956')  # Fixed namespace for our app
         return uuid.uuid5(namespace, string_id)
     
-    def upsert_vectors(self, collection_name, vectors, ids, metadata=None):
+    def upsert_vectors(self, collection_name, vectors, ids, metadata=None, timeout=60):
         """
         Insert or update vectors in collection
         
@@ -115,9 +115,7 @@ class QdrantConnection:
             vectors: List of embedding vectors
             ids: List of IDs corresponding to vectors
             metadata: List of metadata dicts for each vector
-            
-        Returns:
-            bool: True if successful
+            timeout: Thời gian chờ tối đa (giây), mặc định 60
         """
         try:
             if metadata is None:
@@ -125,12 +123,8 @@ class QdrantConnection:
             
             points = []
             for i, (vec, id_str, meta) in enumerate(zip(vectors, ids, metadata)):
-                # Convert string ID to UUID for Qdrant
                 uuid_id = self._string_to_uuid(id_str)
-                
-                # Store original ID in metadata
                 meta['original_id'] = id_str
-                
                 points.append(
                     models.PointStruct(
                         id=str(uuid_id),
@@ -141,7 +135,8 @@ class QdrantConnection:
             
             self.client.upsert(
                 collection_name=collection_name,
-                points=points
+                points=points,
+                timeout=timeout   # ⬅️ THÊM DÒNG NÀY
             )
             
             logger.info(f"Upserted {len(vectors)} vectors to collection '{collection_name}'")
@@ -153,28 +148,18 @@ class QdrantConnection:
     
     def search(self, collection_name, query_vector, limit=10, filter_condition=None):
         """
-        Search for similar vectors
-        
-        Args:
-            collection_name: Name of the collection
-            query_vector: Query embedding vector
-            limit: Maximum number of results
-            filter_condition: Optional filter condition
-            
-        Returns:
-            list: Search results with scores and payloads
+        Search for similar vectors using query_points (qdrant-client >= 1.10.0)
         """
         try:
-            results = self.client.search(
+            results = self.client.query_points(
                 collection_name=collection_name,
-                query_vector=query_vector,
+                query=query_vector,           # vector truy vấn
                 limit=limit,
-                query_filter=filter_condition
+                query_filter=filter_condition,
+                with_payload=True,            # lấy payload
             )
-            
-            logger.info(f"Found {len(results)} results in collection '{collection_name}'")
-            return results
-            
+            # results.points là list các điểm
+            return results.points
         except Exception as e:
             logger.error(f"Search failed: {str(e)}")
             return []
